@@ -38,12 +38,13 @@ def find_first_valid_row(df, column_index, expected_value):
             return i
     return None
 
-def get_detailed_pnl_from_sheet(df_raw, pnl_type):
+def get_detailed_pnl_from_sheet(df_raw, pnl_type, st_separator_label, lt_separator_label):
     """
     Parses a P&L sheet (Equity or MF) to extract detailed short-term and long-term trades.
+    Accepts specific labels for separators to handle variations between sheets.
     """
-    st_separator = find_first_valid_row(df_raw, 1, "Short Term Trades")
-    lt_separator = find_first_valid_row(df_raw, 1, "Long Term Trades")
+    st_separator = find_first_valid_row(df_raw, 1, st_separator_label)
+    lt_separator = find_first_valid_row(df_raw, 1, lt_separator_label)
     
     trades = []
 
@@ -109,23 +110,35 @@ async def process_pnl_file(file: UploadFile = File(...)):
         client_name_row = find_first_valid_row(df_equity_raw, 1, "Client Name")
         client_name = df_equity_raw.iloc[client_name_row, 2] if client_name_row is not None else "Guest"
 
-        # --- Process Summary P&L Data ---
-        def get_summary_pnl(df, st_label, lt_label):
-            df_indexed = df.set_index(df.columns[1])
-            st_val = pd.to_numeric(df_indexed.loc[st_label].iloc[0], errors='coerce')
-            lt_val = pd.to_numeric(df_indexed.loc[lt_label].iloc[0], errors='coerce')
-            short_term = st_val if np.isfinite(st_val) else 0
-            long_term = lt_val if np.isfinite(lt_val) else 0
-            return {"shortTerm": short_term, "longTerm": long_term, "total": short_term + long_term}
-
-        equity_pnl_summary = get_summary_pnl(df_equity_raw.dropna(how='all'), 'Short Term profit', 'Long Term profit')
-        mf_pnl_summary = get_summary_pnl(df_mf_raw.dropna(how='all'), 'Short Term profit Equity', 'Long Term profit Equity')
 
         # --- Process Detailed P&L from Equity and MF sheets ---
-        equity_pnl_details = get_detailed_pnl_from_sheet(df_equity_raw, 'Equity')
-        mf_pnl_details = get_detailed_pnl_from_sheet(df_mf_raw, 'Mutual Fund')
+        equity_pnl_details = get_detailed_pnl_from_sheet(df_equity_raw, 'Equity', "Short Term Trades", "Long Term Trades")
+        mf_pnl_details = get_detailed_pnl_from_sheet(df_mf_raw, 'Mutual Fund', "Short Term Trades Equity", "Long Term Trades Equity")
+        print(mf_pnl_details,end='\n\n')
         all_pnl_details = pd.concat([equity_pnl_details, mf_pnl_details], ignore_index=True)
+        unwanted_patterns = 'Short Term Trades Debt|Long Term Trades Debt|Debt - Purchases post 2023-04-01'
+        all_pnl_details = all_pnl_details[~all_pnl_details['Symbol'].str.contains(unwanted_patterns, na=False, case=False)]
+        print(mf_pnl_details)
+        
+        # --- Calculate P&L Summaries from Detailed Data ---
+        all_pnl_details['Realized P&L'] = pd.to_numeric(all_pnl_details['Realized P&L'], errors='coerce').fillna(0)
+        pnl_pivot = all_pnl_details.pivot_table(index='type', columns='term', values='Realized P&L', aggfunc='sum').fillna(0)
 
+        def safe_get_from_pivot(pivot, index, column):
+            if index in pivot.index and column in pivot.columns:
+                return pivot.loc[index, column]
+            return 0
+
+        equity_st = safe_get_from_pivot(pnl_pivot, 'Equity', 'Short Term')
+        equity_lt = safe_get_from_pivot(pnl_pivot, 'Equity', 'Long Term')
+        equity_pnl_summary = {"shortTerm": equity_st, "longTerm": equity_lt, "total": equity_st + equity_lt}
+
+        mf_st = safe_get_from_pivot(pnl_pivot, 'Mutual Fund', 'Short Term')
+        mf_lt = safe_get_from_pivot(pnl_pivot, 'Mutual Fund', 'Long Term')
+        mf_pnl_summary = {"shortTerm": mf_st, "longTerm": mf_lt, "total": mf_st + mf_lt}
+
+        print(mf_pnl_summary, end='\n\n')
+        print(equity_pnl_summary, end='\n\n')
         # --- Process All Transactions from Tradewise Exits sheet ---
         header_row_index = find_first_valid_row(df_exits_raw, 1, "Symbol")
         if header_row_index is None:
@@ -171,6 +184,7 @@ async def process_pnl_file(file: UploadFile = File(...)):
         transactions_map = {'Symbol': 'symbol', 'Entry Date': 'entryDate', 'Exit Date': 'exitDate', 'Quantity': 'quantity', 'Buy Value': 'buyValue', 'Sell Value': 'sellValue', 'Profit': 'profit', 'Period of Holding': 'holdingPeriod', 'Type': 'type'}
         transactions_json = clean_and_convert_to_json(all_transactions, transactions_map)
 
+        print(pnl_details_json)
         final_response = {
             "clientName": client_name,
             "equityPnL": equity_pnl_summary,
